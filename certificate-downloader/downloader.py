@@ -1,10 +1,15 @@
 import asyncio
 import os
+import re
 from playwright.async_api import async_playwright
 
 
-async def download_certificate(url, output_folder="downloads"):
-
+async def download_certificate(url, output_folder="downloads", nop_id=""):
+    """
+    Download a certificate PDF from the USDA NOP Integrity Database.
+    Uses Playwright to handle the Blazor SPA and intercept PDF downloads.
+    Returns the saved file path on success, None on failure.
+    """
     os.makedirs(output_folder, exist_ok=True)
 
     print(f"\n  Processing: {url}")
@@ -14,113 +19,185 @@ async def download_certificate(url, output_folder="downloads"):
 
             browser = await p.chromium.launch(headless=True)
 
-            context = await browser.new_context(accept_downloads=True)
+            context = await browser.new_context(
+                accept_downloads=True,
+                viewport={"width": 1280, "height": 900},
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/120.0.0.0 Safari/537.36"
+                ),
+            )
 
             page = await context.new_page()
 
-            # Inject a hook BEFORE page loads to intercept Blazor's downloadFromByteArray
+            # Intercept network responses to catch PDF data directly
+            pdf_responses = []
+
+            async def handle_response(response):
+                content_type = response.headers.get("content-type", "")
+                if "pdf" in content_type or response.url.endswith(".pdf"):
+                    try:
+                        body = await response.body()
+                        pdf_responses.append({
+                            "data": body,
+                            "url": response.url,
+                        })
+                    except Exception:
+                        pass
+
+            page.on("response", handle_response)
+
+            # Inject JS hook BEFORE page loads to capture Blazor downloads
             await page.add_init_script("""
                 window.__captured_downloads = [];
-                // Override the Blazor download function to capture file data
-                const origFunc = window.downloadFromByteArray;
-                Object.defineProperty(window, 'downloadFromByteArray', {
-                    value: function(byteArray, fileName, contentType) {
+                
+                // Hook downloadFromByteArray (Blazor's download method)
+                const hookDownload = () => {
+                    if (window.__hooked) return;
+                    const orig = window.downloadFromByteArray;
+                    window.downloadFromByteArray = function(byteArray, fileName, contentType) {
                         window.__captured_downloads.push({
-                            data: byteArray,
+                            data: Array.from(byteArray),
                             fileName: fileName,
                             contentType: contentType
                         });
-                        // Also call original so the user sees the download in browser (if not headless)
-                        if (typeof origFunc === 'function') {
-                            origFunc(byteArray, fileName, contentType);
+                        if (orig && typeof orig === 'function') {
+                            orig(byteArray, fileName, contentType);
                         }
-                    },
-                    writable: true,
-                    configurable: true
-                });
+                    };
+                    window.__hooked = true;
+                };
+                
+                hookDownload();
+                
+                // Re-hook periodically in case Blazor overwrites it
+                setInterval(hookDownload, 500);
             """)
 
-            # Try loading page
+            # Load the page
             try:
-                await page.goto(url, timeout=30000)
-            except Exception as e:
-                print("  Page failed to load")
-                print(f"  {e}")
-                await browser.close()
-                return False
+                await page.goto(url, wait_until="networkidle", timeout=45000)
+            except Exception:
+                # Even if timeout, page might still be usable
+                try:
+                    await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                except Exception as e:
+                    print(f"  Page failed to load: {e}")
+                    await browser.close()
+                    return None
 
-            # Wait for the SPA (Blazor) content to render
-            await asyncio.sleep(3)
+            # Wait for Blazor SPA to fully render
+            print("  Waiting for page to render...")
+            for _ in range(15):
+                await asyncio.sleep(1)
+                # Check if key content is visible
+                has_content = await page.evaluate("""
+                    document.body.innerText.includes('Print Certificate') ||
+                    document.body.innerText.includes('Export to PDF') ||
+                    document.body.innerText.includes('Certificate') ||
+                    document.querySelector('[class*="certificate"]') !== null
+                """)
+                if has_content:
+                    break
 
-            # Re-hook the function after Blazor initializes (it may overwrite our hook)
+            # Re-hook after Blazor has initialized
             await page.evaluate("""
-                if (!window.__download_hooked) {
-                    const origFunc = window.downloadFromByteArray;
+                if (!window.__hooked) {
+                    const orig = window.downloadFromByteArray;
                     window.downloadFromByteArray = function(byteArray, fileName, contentType) {
                         window.__captured_downloads = window.__captured_downloads || [];
                         window.__captured_downloads.push({
-                            data: byteArray,
+                            data: Array.from(byteArray),
                             fileName: fileName,
                             contentType: contentType
                         });
-                        if (origFunc && origFunc !== window.downloadFromByteArray) {
-                            origFunc(byteArray, fileName, contentType);
+                        if (orig && typeof orig === 'function' && orig !== window.downloadFromByteArray) {
+                            orig(byteArray, fileName, contentType);
                         }
                     };
-                    window.__download_hooked = true;
+                    window.__hooked = true;
                 }
             """)
 
-            # Try finding the Print Certificate button
-            try:
-                button = await page.wait_for_selector(
-                    "button.fsa-btn:has-text('Print Certificate')",
-                    timeout=10000
-                )
-            except:
-                # Fallback: try text selector
-                try:
-                    button = await page.wait_for_selector(
-                        "text=Print Certificate",
-                        timeout=5000
-                    )
-                except:
-                    print("  'Print Certificate' button not found")
-                    await browser.close()
-                    return False
+            # Check if the page has valid certificate data
+            page_text = await page.evaluate("document.body.innerText")
+            if "no records found" in page_text.lower() or "no results" in page_text.lower():
+                print("  No certificate found for this NOP ID.")
+                await browser.close()
+                return None
 
-            # Click the button and wait for the download to be captured
-            print("  Clicking 'Print Certificate'...")
-            
-            # Set up a download listener as a fallback (in case it triggers a real download)
             download_happened = False
             saved_path = None
+            default_filename = f"{nop_id}_OperationProfile.pdf" if nop_id else "certificate.pdf"
 
+            # --- Strategy 1: Click "Export to PDF" link ---
+            print("  Looking for Export to PDF...")
             try:
-                async with page.expect_download(timeout=15000) as download_info:
-                    await button.click()
-                
-                # If we get here, it was a real browser download
-                download = await download_info.value
-                filename = download.suggested_filename
-                saved_path = os.path.join(output_folder, filename)
-                await download.save_as(saved_path)
-                download_happened = True
-                print(f"  Downloaded (browser): {saved_path}")
-                
-            except:
-                # Not a real browser download — check if JS captured it
-                await asyncio.sleep(5)  # Wait for Blazor to process
-                
+                export_btn = await page.wait_for_selector(
+                    "text=Export to PDF", timeout=8000
+                )
+                if export_btn:
+                    print("  Clicking 'Export to PDF'...")
+                    try:
+                        async with page.expect_download(timeout=20000) as dl_info:
+                            await export_btn.click()
+                        download = await dl_info.value
+                        filename = download.suggested_filename or default_filename
+                        saved_path = os.path.join(output_folder, filename)
+                        await download.save_as(saved_path)
+                        download_happened = True
+                        print(f"  Downloaded (browser download): {saved_path}")
+                    except Exception:
+                        # Download might be via JS, not browser download
+                        await asyncio.sleep(5)
+            except Exception:
+                pass
+
+            # --- Strategy 2: Click "Print Certificate" button ---
+            if not download_happened:
+                print("  Looking for Print Certificate button...")
+                try:
+                    button = None
+                    for selector in [
+                        "button:has-text('Print Certificate')",
+                        "a:has-text('Print Certificate')",
+                        "text=Print Certificate",
+                        "[onclick*='Print']",
+                        "button.fsa-btn:has-text('Print')",
+                    ]:
+                        try:
+                            button = await page.wait_for_selector(selector, timeout=3000)
+                            if button:
+                                break
+                        except Exception:
+                            continue
+
+                    if button:
+                        print("  Clicking 'Print Certificate'...")
+                        try:
+                            async with page.expect_download(timeout=20000) as dl_info:
+                                await button.click()
+                            download = await dl_info.value
+                            filename = download.suggested_filename or default_filename
+                            saved_path = os.path.join(output_folder, filename)
+                            await download.save_as(saved_path)
+                            download_happened = True
+                            print(f"  Downloaded (browser download): {saved_path}")
+                        except Exception:
+                            await asyncio.sleep(5)
+                except Exception:
+                    pass
+
+            # --- Strategy 3: Check JS captured downloads ---
+            if not download_happened:
                 captured = await page.evaluate("window.__captured_downloads || []")
-                
                 if captured:
+                    print(f"  Found {len(captured)} JS-captured download(s)...")
                     for item in captured:
-                        filename = item.get("fileName", "certificate.pdf")
-                        data = item.get("data", "")
-                        
+                        filename = item.get("fileName", default_filename)
+                        data = item.get("data", [])
                         if data:
-                            # Blazor sends byte arrays as lists of integers
                             if isinstance(data, list):
                                 pdf_bytes = bytes(data)
                             elif isinstance(data, str):
@@ -133,37 +210,38 @@ async def download_certificate(url, output_folder="downloads"):
                                 f.write(pdf_bytes)
                             download_happened = True
                             print(f"  Downloaded (JS capture): {saved_path}")
-                else:
-                    # Last resort: use page.pdf() to save as PDF
-                    print("  No download detected, trying page PDF export...")
-                    
-                    # Try clicking Export to PDF link instead
-                    try:
-                        export_btn = await page.query_selector("text=Export to PDF")
-                        if export_btn:
-                            await export_btn.click()
-                            await asyncio.sleep(5)
-                            
-                            captured = await page.evaluate("window.__captured_downloads || []")
-                            if captured:
-                                for item in captured:
-                                    filename = item.get("fileName", "certificate.pdf")
-                                    data = item.get("data", "")
-                                    if data:
-                                        if isinstance(data, list):
-                                            pdf_bytes = bytes(data)
-                                        elif isinstance(data, str):
-                                            import base64
-                                            pdf_bytes = base64.b64decode(data)
-                                        else:
-                                            continue
-                                        saved_path = os.path.join(output_folder, filename)
-                                        with open(saved_path, "wb") as f:
-                                            f.write(pdf_bytes)
-                                        download_happened = True
-                                        print(f"  Downloaded (Export to PDF): {saved_path}")
-                    except Exception as ex:
-                        print(f"  Export to PDF also failed: {ex}")
+                            break
+
+            # --- Strategy 4: Check intercepted network PDF responses ---
+            if not download_happened and pdf_responses:
+                print(f"  Found {len(pdf_responses)} PDF response(s) from network...")
+                for resp in pdf_responses:
+                    saved_path = os.path.join(output_folder, default_filename)
+                    with open(saved_path, "wb") as f:
+                        f.write(resp["data"])
+                    download_happened = True
+                    print(f"  Downloaded (network intercept): {saved_path}")
+                    break
+
+            # --- Strategy 5: Screenshot the page as PDF (last resort) ---
+            if not download_happened:
+                print("  Trying direct PDF export of the page...")
+                try:
+                    # Use CDP to print page as PDF
+                    cdp = await context.new_cdp_session(page)
+                    result = await cdp.send("Page.printToPDF", {
+                        "printBackground": True,
+                        "preferCSSPageSize": True,
+                    })
+                    import base64
+                    pdf_bytes = base64.b64decode(result["data"])
+                    saved_path = os.path.join(output_folder, default_filename)
+                    with open(saved_path, "wb") as f:
+                        f.write(pdf_bytes)
+                    download_happened = True
+                    print(f"  Downloaded (page PDF export): {saved_path}")
+                except Exception as ex:
+                    print(f"  PDF export failed: {ex}")
 
             if not download_happened:
                 print("  Could not download the certificate.")
@@ -172,6 +250,5 @@ async def download_certificate(url, output_folder="downloads"):
             return saved_path if download_happened else None
 
     except Exception as e:
-        print("  Unexpected error occurred")
-        print(f"  {e}")
+        print(f"  Unexpected error: {e}")
         return None
