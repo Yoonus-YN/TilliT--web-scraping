@@ -202,61 +202,59 @@ async def download_certificate(url, output_folder="downloads", nop_id=""):
 
             download_happened = False
             saved_path = None
-            default_filename = f"{nop_id}_OperationProfile.pdf" if nop_id else "certificate.pdf"
+            default_filename = f"Certificate_{nop_id}.pdf" if nop_id else "certificate.pdf"
 
-            # --- Strategy 1: Click "Export to PDF" link ---
-            print("  Looking for Export to PDF...")
+            # --- Strategy 1: Click "Print Certificate" button (actual certificate) ---
+            print("  Looking for Print Certificate button...")
             try:
-                export_btn = await page.wait_for_selector(
-                    "text=Export to PDF", timeout=8000
-                )
-                if export_btn:
-                    print("  Clicking 'Export to PDF'...")
+                button = None
+                for selector in [
+                    "button:has-text('Print Certificate')",
+                    "a:has-text('Print Certificate')",
+                    "text=Print Certificate",
+                    "button.fsa-btn:has-text('Print')",
+                ]:
                     try:
-                        async with page.expect_download(timeout=20000) as dl_info:
-                            await export_btn.click()
+                        button = await page.wait_for_selector(selector, timeout=5000)
+                        if button:
+                            break
+                    except Exception:
+                        continue
+
+                if button:
+                    print("  Clicking 'Print Certificate'...")
+                    try:
+                        async with page.expect_download(timeout=30000) as dl_info:
+                            await button.click()
                         download = await dl_info.value
                         filename = download.suggested_filename or default_filename
                         saved_path = os.path.join(output_folder, filename)
                         await download.save_as(saved_path)
                         download_happened = True
-                        print(f"  Downloaded (browser download): {saved_path}")
+                        print(f"  Downloaded (certificate): {saved_path}")
                     except Exception:
-                        # Download might be via JS, not browser download
                         await asyncio.sleep(5)
             except Exception:
                 pass
 
-            # --- Strategy 2: Click "Print Certificate" button ---
+            # --- Strategy 2: Click "Export to PDF" link (fallback) ---
             if not download_happened:
-                print("  Looking for Print Certificate button...")
+                print("  Trying Export to PDF as fallback...")
                 try:
-                    button = None
-                    for selector in [
-                        "button:has-text('Print Certificate')",
-                        "a:has-text('Print Certificate')",
-                        "text=Print Certificate",
-                        "[onclick*='Print']",
-                        "button.fsa-btn:has-text('Print')",
-                    ]:
-                        try:
-                            button = await page.wait_for_selector(selector, timeout=3000)
-                            if button:
-                                break
-                        except Exception:
-                            continue
-
-                    if button:
-                        print("  Clicking 'Print Certificate'...")
+                    export_btn = await page.wait_for_selector(
+                        "text=Export to PDF", timeout=8000
+                    )
+                    if export_btn:
+                        print("  Clicking 'Export to PDF'...")
                         try:
                             async with page.expect_download(timeout=20000) as dl_info:
-                                await button.click()
+                                await export_btn.click()
                             download = await dl_info.value
                             filename = download.suggested_filename or default_filename
                             saved_path = os.path.join(output_folder, filename)
                             await download.save_as(saved_path)
                             download_happened = True
-                            print(f"  Downloaded (browser download): {saved_path}")
+                            print(f"  Downloaded (export PDF): {saved_path}")
                         except Exception:
                             await asyncio.sleep(5)
                 except Exception:
