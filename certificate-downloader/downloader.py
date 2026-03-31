@@ -24,68 +24,84 @@ async def search_nop_id(nop_id):
     Search the USDA Organic Integrity Database for a NOP ID.
     Returns the full certificate page URL if found, or None.
     """
-    async with async_playwright() as p:
-        browser, context = await _create_browser_context(p)
-        page = await context.new_page()
+    max_retries = 3
+    for attempt in range(1, max_retries + 1):
+        async with async_playwright() as p:
+            browser, context = await _create_browser_context(p)
+            page = await context.new_page()
 
-        try:
-            print("  [1/3] Searching USDA database...")
-            await page.goto(
-                "https://organic.ams.usda.gov/integrity/Search",
-                wait_until="domcontentloaded",
-                timeout=30000,
-            )
+            try:
+                if attempt == 1:
+                    print("  [1/3] Searching USDA database...")
+                else:
+                    print(f"  [1/3] Searching USDA database (attempt {attempt}/{max_retries})...")
 
-            # Wait for Blazor SPA to load
-            nop_input = None
-            for _ in range(15):
-                await asyncio.sleep(2)
-                nop_input = await page.query_selector("#tbOperationId")
-                if nop_input:
-                    break
+                await page.goto(
+                    "https://organic.ams.usda.gov/integrity/Search",
+                    wait_until="domcontentloaded",
+                    timeout=90000,
+                )
 
-            if not nop_input:
-                print("  Search page did not load properly.")
+                # Wait for Blazor SPA to load
+                nop_input = None
+                for _ in range(30):
+                    await asyncio.sleep(2)
+                    nop_input = await page.query_selector("#tbOperationId")
+                    if nop_input:
+                        break
+
+                if not nop_input:
+                    print("  Search page did not load properly.")
+                    await browser.close()
+                    if attempt < max_retries:
+                        print("  Retrying...")
+                        continue
+                    return None
+
+                # Fill NOP ID and search
+                await nop_input.fill(nop_id)
+                await asyncio.sleep(1)
+
+                search_btn = await page.query_selector("button:has-text('Search')")
+                if search_btn:
+                    await search_btn.click()
+                    await asyncio.sleep(8)
+
+                # Check for results
+                page_text = await page.evaluate("document.body.innerText")
+                if "0 - 0 of 0 items" in page_text or "No Records Found" in page_text:
+                    print(f"  NOP ID {nop_id} not found in USDA database.")
+                    await browser.close()
+                    return None
+
+                # Get the certificate link from search results
+                links = await page.evaluate("""
+                    Array.from(document.querySelectorAll('a'))
+                        .map(a => a.href)
+                        .filter(href => href.includes('OPP') && href.includes('nopid'))
+                """)
+
+                if links:
+                    cert_url = links[0]
+                    # Clean the URL (remove ret= params for cleaner access)
+                    if "&ret=" in cert_url:
+                        cert_url = cert_url.split("&ret=")[0]
+                    print(f"  Found certificate URL!")
+                    await browser.close()
+                    return cert_url
+
+                print("  No certificate link found in search results.")
+                await browser.close()
                 return None
 
-            # Fill NOP ID and search
-            await nop_input.fill(nop_id)
-            await asyncio.sleep(1)
-
-            search_btn = await page.query_selector("button:has-text('Search')")
-            if search_btn:
-                await search_btn.click()
-                await asyncio.sleep(8)
-
-            # Check for results
-            page_text = await page.evaluate("document.body.innerText")
-            if "0 - 0 of 0 items" in page_text or "No Records Found" in page_text:
-                print(f"  NOP ID {nop_id} not found in USDA database.")
+            except Exception as e:
+                print(f"  Search error: {e}")
+                await browser.close()
+                if attempt < max_retries:
+                    print(f"  Retrying in 5 seconds...")
+                    await asyncio.sleep(5)
+                    continue
                 return None
-
-            # Get the certificate link from search results
-            links = await page.evaluate("""
-                Array.from(document.querySelectorAll('a'))
-                    .map(a => a.href)
-                    .filter(href => href.includes('OPP') && href.includes('nopid'))
-            """)
-
-            if links:
-                cert_url = links[0]
-                # Clean the URL (remove ret= params for cleaner access)
-                if "&ret=" in cert_url:
-                    cert_url = cert_url.split("&ret=")[0]
-                print(f"  Found certificate URL!")
-                return cert_url
-
-            print("  No certificate link found in search results.")
-            return None
-
-        except Exception as e:
-            print(f"  Search error: {e}")
-            return None
-        finally:
-            await browser.close()
 
 
 async def download_certificate(url, output_folder="downloads", nop_id=""):
@@ -150,11 +166,11 @@ async def download_certificate(url, output_folder="downloads", nop_id=""):
 
             # Load the page
             try:
-                await page.goto(url, wait_until="networkidle", timeout=45000)
+                await page.goto(url, wait_until="networkidle", timeout=90000)
             except Exception:
                 # Even if timeout, page might still be usable
                 try:
-                    await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                    await page.goto(url, wait_until="domcontentloaded", timeout=90000)
                 except Exception as e:
                     print(f"  Page failed to load: {e}")
                     await browser.close()
