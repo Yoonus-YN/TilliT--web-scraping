@@ -7,7 +7,7 @@ from winotify import Notification, audio
 
 # Fix imports so this works from any directory
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from downloader import download_certificate
+from downloader import download_certificate, search_nop_id
 
 
 def notify(title, message, file_path=None):
@@ -30,7 +30,7 @@ def print_banner():
     print("\033[36m" + "=" * 60 + "\033[0m")
     print("\033[36m" + "   ╔╦╗╦╦  ╦  ╦╔╦╗  ─  NOP Certificate Downloader" + "\033[0m")
     print("\033[36m" + "    ║ ║║  ║  ║ ║   ─  USDA Organic Integrity Database" + "\033[0m")
-    print("\033[36m" + "    ╩ ╩╩═╝╩═╝╩ ╩   ─  Web Scraping Tool v2.0" + "\033[0m")
+    print("\033[36m" + "    ╩ ╩╩═╝╩═╝╩ ╩   ─  Web Scraping Tool v3.0" + "\033[0m")
     print("\033[36m" + "=" * 60 + "\033[0m")
 
 
@@ -39,9 +39,6 @@ async def main():
     output_folder = os.path.join(os.path.expanduser("~"), "Downloads")
     os.makedirs(output_folder, exist_ok=True)
 
-    # The search URL works for ALL certifiers — no cid needed
-    search_url: str = "https://organic.ams.usda.gov/integrity/Api/Search?keyword="
-    cert_url: str = "https://organic.ams.usda.gov/integrity/CP/OPP?cid={cid}&nopid={nop}"
     downloaded_count: int = 0
     failed_count: int = 0
 
@@ -72,44 +69,27 @@ async def main():
 
         start_time = time.time()
 
-        # --- Step 1: Lookup the NOP ID via the API to find the correct certifier ID ---
-        print(f"  \033[90mSearching for NOP ID: {user_input} ...\033[0m")
+        # --- Step 1: Search USDA database to find the correct certificate URL ---
+        cert_url = await search_nop_id(user_input)
 
-        full_url = None
-        try:
-            import requests
-            api_url = f"{search_url}{user_input}"
-            resp = requests.get(api_url, timeout=15)
-            if resp.status_code == 200:
-                results = resp.json()
-                # Find exact NOP ID match
-                for item in results:
-                    op_nop = str(item.get("op_nopOpID", ""))
-                    if op_nop == user_input:
-                        cid = item.get("ci_certId", "")
-                        if cid:
-                            full_url = cert_url.format(cid=cid, nop=user_input)
-                        break
-                if not full_url and results:
-                    # Use first result if no exact match
-                    cid = results[0].get("ci_certId", "")
-                    if cid:
-                        full_url = cert_url.format(cid=cid, nop=user_input)
-        except Exception:
-            pass
-
-        # Fallback: use default URL format
-        if not full_url:
-            full_url = f"https://organic.ams.usda.gov/integrity/CP/OPP?cid=87&nopid={user_input}"
+        if not cert_url:
+            failed_count += 1
+            elapsed = time.time() - start_time
+            print(f"  \033[31m[✗] NOP ID {user_input} not found in USDA database — {elapsed:.1f}s\033[0m")
+            notify(
+                "NOP ID Not Found",
+                f"NOP ID {user_input} does not exist in the USDA database.",
+            )
+            continue
 
         # --- Step 2: Open in browser ---
-        print(f"  \033[94m[>>] Opening: {full_url}\033[0m")
-        webbrowser.open(full_url)
+        print(f"  \033[94m[>>] Opening: {cert_url}\033[0m")
+        webbrowser.open(cert_url)
 
         # --- Step 3: Download the certificate via Playwright ---
         try:
             saved_path = await download_certificate(
-                full_url, output_folder=output_folder, nop_id=user_input
+                cert_url, output_folder=output_folder, nop_id=user_input
             )
             elapsed = time.time() - start_time
 
@@ -128,7 +108,7 @@ async def main():
                 print(f"  \033[31m[✗] Could not download certificate for NOP ID {user_input} — {elapsed:.1f}s\033[0m")
                 notify(
                     "Download Failed",
-                    f"Could not find certificate for NOP ID {user_input}.",
+                    f"Could not download certificate for NOP ID {user_input}.",
                 )
         except Exception as e:
             failed_count += 1

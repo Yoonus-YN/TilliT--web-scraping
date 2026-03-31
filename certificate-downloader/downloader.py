@@ -1,7 +1,91 @@
 import asyncio
+import base64
 import os
-import re
 from playwright.async_api import async_playwright
+
+
+async def _create_browser_context(p):
+    """Create a browser context with realistic settings."""
+    browser = await p.chromium.launch(headless=True)
+    context = await browser.new_context(
+        accept_downloads=True,
+        viewport={"width": 1280, "height": 900},
+        user_agent=(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+    )
+    return browser, context
+
+
+async def search_nop_id(nop_id):
+    """
+    Search the USDA Organic Integrity Database for a NOP ID.
+    Returns the full certificate page URL if found, or None.
+    """
+    async with async_playwright() as p:
+        browser, context = await _create_browser_context(p)
+        page = await context.new_page()
+
+        try:
+            print("  [1/3] Searching USDA database...")
+            await page.goto(
+                "https://organic.ams.usda.gov/integrity/Search",
+                wait_until="domcontentloaded",
+                timeout=30000,
+            )
+
+            # Wait for Blazor SPA to load
+            nop_input = None
+            for _ in range(15):
+                await asyncio.sleep(2)
+                nop_input = await page.query_selector("#tbOperationId")
+                if nop_input:
+                    break
+
+            if not nop_input:
+                print("  Search page did not load properly.")
+                return None
+
+            # Fill NOP ID and search
+            await nop_input.fill(nop_id)
+            await asyncio.sleep(1)
+
+            search_btn = await page.query_selector("button:has-text('Search')")
+            if search_btn:
+                await search_btn.click()
+                await asyncio.sleep(8)
+
+            # Check for results
+            page_text = await page.evaluate("document.body.innerText")
+            if "0 - 0 of 0 items" in page_text or "No Records Found" in page_text:
+                print(f"  NOP ID {nop_id} not found in USDA database.")
+                return None
+
+            # Get the certificate link from search results
+            links = await page.evaluate("""
+                Array.from(document.querySelectorAll('a'))
+                    .map(a => a.href)
+                    .filter(href => href.includes('OPP') && href.includes('nopid'))
+            """)
+
+            if links:
+                cert_url = links[0]
+                # Clean the URL (remove ret= params for cleaner access)
+                if "&ret=" in cert_url:
+                    cert_url = cert_url.split("&ret=")[0]
+                print(f"  Found certificate URL!")
+                return cert_url
+
+            print("  No certificate link found in search results.")
+            return None
+
+        except Exception as e:
+            print(f"  Search error: {e}")
+            return None
+        finally:
+            await browser.close()
 
 
 async def download_certificate(url, output_folder="downloads", nop_id=""):
@@ -12,23 +96,12 @@ async def download_certificate(url, output_folder="downloads", nop_id=""):
     """
     os.makedirs(output_folder, exist_ok=True)
 
-    print(f"\n  Processing: {url}")
+    print(f"  [2/3] Loading certificate page...")
 
     try:
         async with async_playwright() as p:
 
-            browser = await p.chromium.launch(headless=True)
-
-            context = await browser.new_context(
-                accept_downloads=True,
-                viewport={"width": 1280, "height": 900},
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/120.0.0.0 Safari/537.36"
-                ),
-            )
-
+            browser, context = await _create_browser_context(p)
             page = await context.new_page()
 
             # Intercept network responses to catch PDF data directly
@@ -88,7 +161,7 @@ async def download_certificate(url, output_folder="downloads", nop_id=""):
                     return None
 
             # Wait for Blazor SPA to fully render
-            print("  Waiting for page to render...")
+            print("  [3/3] Waiting for certificate to render...")
             for _ in range(15):
                 await asyncio.sleep(1)
                 # Check if key content is visible
